@@ -1951,6 +1951,221 @@ def generate_patina_sequence_prompts(
 
 
 # ============================================================================
+# AESTHETIC DECOMPOSITION — Layer 2 (0 tokens)
+# ============================================================================
+# Inverse of the generative pipeline: text description → 5D coordinates.
+# Uses PATINA_VISUAL_TYPES keyword vocabulary for deterministic matching.
+# Algorithm: tokenize → score visual types → softmax blend → coordinates.
+
+_DECOMPOSE_STOP_WORDS = frozenset({
+    'a', 'an', 'the', 'in', 'on', 'at', 'to', 'of', 'for', 'with',
+    'by', 'from', 'and', 'or', 'but', 'as', 'is', 'are', 'was', 'were',
+    'be', 'been', 'being', 'has', 'have', 'had', 'do', 'does', 'did',
+    'no', 'not', 'all', 'its', 'this', 'that', 'into', 'over',
+})
+
+_DECOMPOSE_SOFTMAX_TEMP = 1.5
+_DECOMPOSE_SUBSTR_WEIGHT = 1.0
+_DECOMPOSE_WORD_OVERLAP_WEIGHT = 0.3
+_DECOMPOSE_OPTICAL_WEIGHT = 0.5
+_DECOMPOSE_COLOR_WEIGHT = 0.4
+_DECOMPOSE_MIN_CONFIDENCE = 0.05
+
+
+def _decompose_extract_fragments(keyword: str) -> List[str]:
+    """Sliding-window sub-phrases (2-4 words) from a keyword string."""
+    words = keyword.lower().split()
+    frags = []
+    if len(words) >= 3:
+        frags.append(keyword.lower())
+    for ws in [4, 3, 2]:
+        for i in range(len(words) - ws + 1):
+            chunk = words[i:i + ws]
+            content = [w for w in chunk if len(w) > 3 and w not in _DECOMPOSE_STOP_WORDS]
+            if content:
+                frags.append(' '.join(chunk))
+    return frags
+
+
+def _decompose_score_type(
+    vtype_data: Dict[str, Any],
+    words: set,
+    full_text: str,
+) -> tuple:
+    """Score one visual type against input text. Returns (score, matched_fragments)."""
+    score = 0.0
+    matched = []
+
+    for kw in vtype_data.get("keywords", []):
+        best_s, best_f = 0.0, None
+        for frag in _decompose_extract_fragments(kw):
+            if frag in full_text:
+                if _DECOMPOSE_SUBSTR_WEIGHT > best_s:
+                    best_s, best_f = _DECOMPOSE_SUBSTR_WEIGHT, frag
+            else:
+                fw = set(frag.split()) - _DECOMPOSE_STOP_WORDS
+                if fw:
+                    overlap = len(fw & words) / len(fw)
+                    ws = overlap * _DECOMPOSE_WORD_OVERLAP_WEIGHT
+                    if ws > best_s:
+                        best_s, best_f = ws, frag
+        if best_f and best_s > 0:
+            score += best_s
+            matched.append(best_f)
+
+    for pname, pval in vtype_data.get("optical", {}).items():
+        pw = set(pval.lower().replace('_', ' ').split())
+        po = len(pw & words)
+        if po > 0:
+            score += _DECOMPOSE_OPTICAL_WEIGHT * (po / len(pw))
+            matched.append(f"optical:{pval}")
+
+    for color in vtype_data.get("color_associations", []):
+        cl = color.lower()
+        if cl in full_text:
+            score += _DECOMPOSE_COLOR_WEIGHT
+            matched.append(f"color:{color}")
+        else:
+            cw = set(cl.split()) - _DECOMPOSE_STOP_WORDS
+            if cw and len(cw & words) > 0:
+                score += _DECOMPOSE_COLOR_WEIGHT * 0.5 * (len(cw & words) / len(cw))
+
+    return score, matched
+
+
+def _decompose_patina(description: str) -> Dict[str, Any]:
+    """Core decomposition: text description → patina 5D coordinates.
+
+    Layer 2: deterministic, 0 LLM tokens.
+    Matches description against PATINA_VISUAL_TYPES keyword vocabulary,
+    blends type center coordinates via softmax weighting.
+    """
+    import re as _re
+    lower = description.lower()
+    words = set(_re.findall(r'[a-z]+(?:-[a-z]+)*', lower))
+
+    # Score each visual type
+    type_scores = {}
+    all_matched = []
+    for tid, tdata in PATINA_VISUAL_TYPES.items():
+        s, m = _decompose_score_type(tdata, words, lower)
+        type_scores[tid] = s
+        all_matched.extend(m)
+
+    max_score = max(type_scores.values()) if type_scores else 0
+    n_kw = max(len(t.get("keywords", [])) for t in PATINA_VISUAL_TYPES.values()) if PATINA_VISUAL_TYPES else 5
+    max_possible = n_kw * _DECOMPOSE_SUBSTR_WEIGHT + 3 * _DECOMPOSE_OPTICAL_WEIGHT + 4 * _DECOMPOSE_COLOR_WEIGHT
+    confidence = min(1.0, max_score / max_possible) if max_possible > 0 else 0.0
+
+    if confidence < _DECOMPOSE_MIN_CONFIDENCE:
+        return {
+            "domain_id": "patina_weathering",
+            "coordinates": {p: 0.5 for p in PATINA_PARAMETER_NAMES},
+            "confidence": 0.0,
+            "nearest_type": "",
+            "nearest_type_distance": None,
+            "type_scores": {k: round(v, 3) for k, v in type_scores.items()},
+            "type_weights": {},
+            "matched_fragments": [],
+            "optical_match": {},
+            "color_matches": [],
+        }
+
+    # Softmax blend
+    t = _DECOMPOSE_SOFTMAX_TEMP
+    max_s = max(type_scores.values())
+    exps = {k: math.exp((v - max_s) / t) for k, v in type_scores.items()}
+    total_exp = sum(exps.values())
+    weights = {k: v / total_exp for k, v in exps.items()}
+
+    coords = {p: 0.0 for p in PATINA_PARAMETER_NAMES}
+    for tid, tdata in PATINA_VISUAL_TYPES.items():
+        w = weights.get(tid, 0)
+        if w > 0:
+            for p in PATINA_PARAMETER_NAMES:
+                coords[p] += w * tdata["center"].get(p, 0)
+
+    # Nearest type + distance
+    nearest = max(type_scores, key=type_scores.get)
+    nc = PATINA_VISUAL_TYPES[nearest]["center"]
+    dist = math.sqrt(sum((coords.get(p, 0) - nc.get(p, 0)) ** 2 for p in PATINA_PARAMETER_NAMES))
+
+    # Collect match metadata
+    optical_match = {}
+    color_matches = []
+    unique_frags = []
+    for m in all_matched:
+        if m.startswith("optical:"):
+            val = m.split(":", 1)[1]
+            for tid, tdata in PATINA_VISUAL_TYPES.items():
+                for pn, pv in tdata.get("optical", {}).items():
+                    if pv == val:
+                        optical_match[pn] = val
+        elif m.startswith("color:"):
+            color_matches.append(m.split(":", 1)[1])
+        elif m not in unique_frags:
+            unique_frags.append(m)
+
+    return {
+        "domain_id": "patina_weathering",
+        "coordinates": {k: round(v, 4) for k, v in coords.items()},
+        "confidence": round(confidence, 4),
+        "nearest_type": nearest,
+        "nearest_type_distance": round(dist, 4),
+        "type_scores": {k: round(v, 3) for k, v in type_scores.items()},
+        "type_weights": {k: round(v, 4) for k, v in weights.items()},
+        "matched_fragments": unique_frags[:10],
+        "optical_match": optical_match,
+        "color_matches": list(dict.fromkeys(color_matches)),
+    }
+
+
+@mcp.tool()
+def decompose_patina_from_description(description: str) -> str:
+    """Decompose a text description into patina/weathering 5D coordinates.
+
+    Layer 2: deterministic, 0 LLM tokens.
+
+    Inverse of the generative pipeline — takes a text description
+    (from Claude vision output, user description, or any text describing
+    a weathered/patinated surface) and recovers the 5D parameter
+    coordinates that best match the described aesthetic.
+
+    Algorithm:
+      1. Tokenize description into words and bigrams
+      2. Score each of 6 visual types by keyword fragment matching,
+         optical property overlap, and color association hits
+      3. Softmax-blend visual type center coordinates
+      4. Return coordinates + confidence + matched evidence
+
+    Confidence is NOT "how good the image is" — it measures how much
+    patina/weathering vocabulary is present in the description.
+    A landscape photo with no weathering content returns confidence ≈ 0.
+
+    Args:
+        description: Text describing an image or aesthetic artifact.
+            Works with Claude vision output, user prose, or any text.
+
+    Returns:
+        JSON with:
+        - coordinates: 5D patina parameter values
+            (exposure_duration, agent_intensity, material_resistance,
+             intervention_state, aesthetic_character)
+        - confidence: 0-1 domain presence strength
+        - nearest_type: best-matching visual vocabulary type
+        - nearest_type_distance: coordinate distance to nearest type center
+        - type_scores: raw score per visual type
+        - type_weights: softmax weights used for blending
+        - matched_fragments: keyword fragments found in description
+        - optical_match: matched optical property values
+        - color_matches: matched color associations
+
+    Cost: 0 tokens (deterministic keyword matching + arithmetic)
+    """
+    return json.dumps(_decompose_patina(description), indent=2)
+
+
+# ============================================================================
 # DOMAIN REGISTRY HELPER
 # ============================================================================
 
@@ -2015,7 +2230,7 @@ def get_server_info() -> str:
     """
     return json.dumps({
         "name": "Patina & Weathering MCP",
-        "version": "1.0.0-phase2.7+tier4d",
+        "version": "1.1.0-phase2.7+tier4d+decompose",
         "architecture": "three_layer_olog",
         "description": (
             "Conservation-science weathering composition with zero-cost enhancement. "
@@ -2028,7 +2243,7 @@ def get_server_info() -> str:
             "layer_2": (
                 "Deterministic mapping (intent classification, parameter selection, "
                 "rhythmic presets, trajectory computation, distance, vocabulary, "
-                "attractor prompts)"
+                "attractor prompts, aesthetic decomposition)"
             ),
             "layer_3": "Claude synthesis interface (structured data for creative composition)",
         },
